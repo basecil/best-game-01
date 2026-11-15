@@ -1,461 +1,416 @@
-// TIDEGLASS — drawing only: the world's state and the current screen in,
-// pixels out. The 1280x720 playfield is scaled to fit the window and centred,
-// the margin filled with the backdrop colour. Glass shards are drawn as tiles
-// with a coloured shape inside, so each kind reads by colour and by form.
-// Text that holds a number is rebuilt only when the number changes, so a frame
-// allocates nothing.
-import { BOARD, FIELD, FONT, LEVELS, MOVES_PER_LEVEL, PANEL, PALETTE, PEARL, PEARL_COLOR, SHARDS } from './config.js';
+// Drawing only: the board, the side panel, the overlays and the effects.
+// Nothing here changes the game state; main.js owns the screens and the
+// input, this module just paints what the world and the view describe.
+import {
+  COLS, ROWS, CELL, BOARD_X, BOARD_Y, FIELD_W, FIELD_H, LEVELS,
+  PANEL, SURGE_BTN, SHARDS, PEARL_COLOR, BARNACLE_COLOR, TIDE_MAX,
+} from './config.js';
+import { createRandom } from './random.js';
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_CLEAR = 'clear';
-export const SCREEN_OVER = 'over';
-export const SCREEN_WIN = 'win';
-
-/** The surge button, in field coordinates; main.js hit-tests clicks against it. */
-export const SURGE_BUTTON = { x: 700, y: 528, width: 480, height: 48 };
-
-const TILE_INSET = 6;
-const SHAPE_RADIUS = 17;
-
-/** Fixed bubbles for the backdrop: same positions on every load, so shots are stable. */
-const BUBBLES = (() => {
-  let a = 1234567;
-  const next = () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+const bubbles = (() => {
+  const rng = createRandom(7);
   const list = [];
-  for (let i = 0; i < 26; i += 1) {
-    list.push({ x: next() * FIELD.width, y: next() * FIELD.height, r: 3 + next() * 14, speed: 6 + next() * 14, phase: next() * 6.28 });
+  for (let i = 0; i < 16; i += 1) {
+    list.push({
+      x: rng.next() * FIELD_W, y: rng.next() * FIELD_H,
+      r: 8 + rng.next() * 34, phase: rng.next() * Math.PI * 2,
+      speed: 0.00012 + rng.next() * 0.0002, alpha: 0.03 + rng.next() * 0.05,
+    });
   }
   return list;
 })();
 
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
 }
 
-function roundRect(context, x, y, width, height, radius) {
-  context.beginPath();
-  context.moveTo(x + radius, y);
-  context.arcTo(x + width, y, x + width, y + height, radius);
-  context.arcTo(x + width, y + height, x, y + height, radius);
-  context.arcTo(x, y + height, x, y, radius);
-  context.arcTo(x, y, x + width, y, radius);
-  context.closePath();
+function star(ctx, cx, cy, r) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i += 1) {
+    const ang = (Math.PI / 5) * i - Math.PI / 2;
+    const rad = i % 2 === 0 ? r : r * 0.45;
+    const x = cx + Math.cos(ang) * rad;
+    const y = cy + Math.sin(ang) * rad;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
 }
 
-function drawShape(context, shape, x, y, r, color) {
-  context.fillStyle = color;
-  context.beginPath();
+function glyph(ctx, shape, cx, cy, r, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
   if (shape === 'circle') {
-    context.arc(x, y, r, 0, Math.PI * 2);
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
   } else if (shape === 'diamond') {
-    context.moveTo(x, y - r);
-    context.lineTo(x + r, y);
-    context.lineTo(x, y + r);
-    context.lineTo(x - r, y);
-    context.closePath();
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx + r, cy);
+    ctx.lineTo(cx, cy + r);
+    ctx.lineTo(cx - r, cy);
+    ctx.closePath();
   } else if (shape === 'triangle') {
-    context.moveTo(x, y - r);
-    context.lineTo(x + r * 0.95, y + r * 0.75);
-    context.lineTo(x - r * 0.95, y + r * 0.75);
-    context.closePath();
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx + r * 0.95, cy + r * 0.75);
+    ctx.lineTo(cx - r * 0.95, cy + r * 0.75);
+    ctx.closePath();
   } else if (shape === 'square') {
-    context.rect(x - r * 0.85, y - r * 0.85, r * 1.7, r * 1.7);
+    ctx.rect(cx - r * 0.8, cy - r * 0.8, r * 1.6, r * 1.6);
   } else if (shape === 'hexagon') {
     for (let i = 0; i < 6; i += 1) {
-      const angle = (Math.PI / 3) * i - Math.PI / 6;
-      const px = x + r * Math.cos(angle);
-      const py = y + r * Math.sin(angle);
-      if (i === 0) context.moveTo(px, py);
-      else context.lineTo(px, py);
+      const ang = (Math.PI / 3) * i - Math.PI / 6;
+      const x = cx + Math.cos(ang) * r;
+      const y = cy + Math.sin(ang) * r;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
-    context.closePath();
-  } else if (shape === 'star') {
-    for (let i = 0; i < 10; i += 1) {
-      const angle = (Math.PI / 5) * i - Math.PI / 2;
-      const rad = i % 2 === 0 ? r : r * 0.45;
-      const px = x + rad * Math.cos(angle);
-      const py = y + rad * Math.sin(angle);
-      if (i === 0) context.moveTo(px, py);
-      else context.lineTo(px, py);
-    }
-    context.closePath();
+    ctx.closePath();
   }
-  context.fill();
+  ctx.fill();
 }
 
-export function pointToCell(x, y) {
-  const col = Math.floor((x - BOARD.x) / BOARD.cell);
-  const row = Math.floor((y - BOARD.y) / BOARD.cell);
-  if (col < 0 || col >= BOARD.cols || row < 0 || row >= BOARD.rows) return null;
-  return { col, row };
-}
-
-export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('');
-  const levelScoreLabel = cachedLabel('');
-  const movesLabel = cachedLabel('');
-  const bestLabel = cachedLabel('BEST ');
-  const totalLabel = cachedLabel('');
-
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
+function drawTile(ctx, cell, x, y, selected, cursor) {
+  const s = CELL - 8;
+  roundRect(ctx, x, y, s, s, 13);
+  if (cell.barnacle) {
+    ctx.fillStyle = '#241d16';
+    ctx.fill();
+    ctx.strokeStyle = BARNACLE_COLOR;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#5d5347';
+    ctx.beginPath();
+    ctx.arc(x + s * 0.32, y + s * 0.36, 6, 0, Math.PI * 2);
+    ctx.arc(x + s * 0.66, y + s * 0.58, 8, 0, Math.PI * 2);
+    ctx.arc(x + s * 0.55, y + s * 0.28, 4, 0, Math.PI * 2);
+    ctx.fill();
+    return;
   }
-
-  function toField(wx, wy) {
-    return { x: (wx - view.x) / view.scale, y: (wy - view.y) / view.scale };
+  const cx = x + s / 2;
+  const cy = y + s / 2;
+  if (cell.type === 5) {
+    ctx.fillStyle = '#3a2f10';
+    ctx.fill();
+    ctx.strokeStyle = '#ffd968';
+    ctx.lineWidth = 2.5;
+    ctx.shadowColor = '#ffd968';
+    ctx.shadowBlur = 14;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = PEARL_COLOR;
+    star(ctx, cx, cy, 19);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(cx - 5, cy - 6, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    const shard = SHARDS[cell.type];
+    ctx.fillStyle = '#0d2733';
+    ctx.fill();
+    ctx.strokeStyle = shard.glow;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = shard.glow;
+    ctx.shadowBlur = selected ? 18 : 7;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    glyph(ctx, shard.shape, cx, cy, 14, shard.glyph);
   }
-
-  const fonts = new Map();
-  function text(value, x, y, size, color, align, weight) {
-    const key = `${size}:${weight || ''}`;
-    if (!fonts.has(key)) fonts.set(key, `${weight ? `${weight} ` : ''}${size}px ${FONT}`);
-    context.font = fonts.get(key);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
+  if (selected) {
+    ctx.strokeStyle = '#ffd968';
+    ctx.lineWidth = 3.5;
+    roundRect(ctx, x - 2, y - 2, s + 4, s + 4, 15);
+    ctx.stroke();
   }
-
-  function drawBackground(time) {
-    const gradient = context.createLinearGradient(0, 0, 0, FIELD.height);
-    gradient.addColorStop(0, PALETTE.deep);
-    gradient.addColorStop(1, PALETTE.backdrop);
-    context.fillStyle = gradient;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.fillStyle = 'rgba(79, 195, 247, 0.10)';
-    for (const bubble of BUBBLES) {
-      const rise = (time * bubble.speed + bubble.phase * 40) % (FIELD.height + 80);
-      const y = FIELD.height + 40 - rise;
-      context.beginPath();
-      context.arc(bubble.x, y, bubble.r, 0, Math.PI * 2);
-      context.fill();
+  if (cursor) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 2;
+    const L = 10;
+    const corners = [
+      [x - 4, y - 4, 1, 1], [x + s + 4, y - 4, -1, 1],
+      [x - 4, y + s + 4, 1, -1], [x + s + 4, y + s + 4, -1, -1],
+    ];
+    for (const [px, py, sx, sy] of corners) {
+      ctx.beginPath();
+      ctx.moveTo(px + L * sx, py);
+      ctx.lineTo(px, py);
+      ctx.lineTo(px, py + L * sy);
+      ctx.stroke();
     }
   }
+}
 
-  function drawShard(col, row, type, py, scale, alpha) {
-    const cx = BOARD.x + col * BOARD.cell + BOARD.cell / 2;
-    const cy = py + BOARD.cell / 2;
-    const half = BOARD.cell / 2 - TILE_INSET;
-    context.save();
-    context.globalAlpha = alpha;
-    context.translate(cx, cy);
-    context.scale(scale, scale);
-    context.translate(-cx, -cy);
-    if (type === PEARL) {
-      context.shadowColor = PEARL_COLOR;
-      context.shadowBlur = 18;
-      context.fillStyle = 'rgba(255, 246, 216, 0.35)';
-      roundRect(context, cx - half, cy - half, half * 2, half * 2, 12);
-      context.fill();
-      context.shadowBlur = 0;
-      context.strokeStyle = PEARL_COLOR;
-      context.lineWidth = 2.5;
-      roundRect(context, cx - half, cy - half, half * 2, half * 2, 12);
-      context.stroke();
-      drawShape(context, 'star', cx, cy, SHAPE_RADIUS + 2, '#ffd166');
-      context.fillStyle = '#ffffff';
-      context.beginPath();
-      context.arc(cx, cy, 4, 0, Math.PI * 2);
-      context.fill();
+function drawBoard(ctx, world, view) {
+  roundRect(ctx, BOARD_X - 16, BOARD_Y - 16, COLS * CELL + 32, ROWS * CELL + 32, 20);
+  ctx.fillStyle = 'rgba(255,255,255,0.045)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  const grid = world.state.grid;
+  for (let r = 0; r < ROWS; r += 1) {
+    for (let c = 0; c < COLS; c += 1) {
+      const cell = grid[r][c];
+      const selected = view.selected !== null && view.selected.col === c && view.selected.row === r;
+      const cursor = view.screen === 'play' && view.cursor !== null && view.cursor.col === c && view.cursor.row === r;
+      drawTile(ctx, cell, BOARD_X + c * CELL + 4, BOARD_Y + r * CELL + 4, selected, cursor);
+    }
+  }
+}
+
+function bar(ctx, x, y, w, h, frac, color, track = 'rgba(255,255,255,0.10)') {
+  roundRect(ctx, x, y, w, h, h / 2);
+  ctx.fillStyle = track;
+  ctx.fill();
+  if (frac > 0) {
+    roundRect(ctx, x, y, Math.max(h, w * Math.min(1, frac)), h, h / 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+}
+
+function drawPanel(ctx, world, view) {
+  const s = world.state;
+  const level = LEVELS[s.level - 1];
+  roundRect(ctx, PANEL.x, PANEL.y, PANEL.w, PANEL.h, 18);
+  ctx.fillStyle = 'rgba(255,255,255,0.045)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  const px = PANEL.x + 28;
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#8fb3c0';
+  ctx.font = '600 15px system-ui, sans-serif';
+  ctx.fillText('SCORE', px, PANEL.y + 42);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '800 58px system-ui, sans-serif';
+  ctx.fillText(String(s.totalScore), px, PANEL.y + 104);
+
+  ctx.fillStyle = '#8fb3c0';
+  ctx.font = '600 15px system-ui, sans-serif';
+  ctx.fillText('TARGET', px, PANEL.y + 148);
+  ctx.fillStyle = '#ffd968';
+  ctx.font = '800 34px system-ui, sans-serif';
+  ctx.fillText(String(s.levelScore), px, PANEL.y + 186);
+  ctx.fillStyle = '#8fb3c0';
+  ctx.font = '600 20px system-ui, sans-serif';
+  ctx.fillText(`/ ${level.target}`, px + 118, PANEL.y + 186);
+  bar(ctx, px, PANEL.y + 202, PANEL.w - 56, 12, s.levelScore / level.target, '#38bdf8');
+
+  ctx.fillStyle = '#8fb3c0';
+  ctx.font = '600 15px system-ui, sans-serif';
+  ctx.fillText('MOVES LEFT', px, PANEL.y + 262);
+  ctx.fillStyle = s.moves <= 5 ? '#ff8a7a' : '#ffffff';
+  ctx.font = '800 58px system-ui, sans-serif';
+  ctx.fillText(String(s.moves), px, PANEL.y + 324);
+
+  ctx.fillStyle = '#8fb3c0';
+  ctx.font = '600 15px system-ui, sans-serif';
+  ctx.fillText('TIDE', px, PANEL.y + 362);
+  bar(ctx, px, PANEL.y + 376, PANEL.w - 56, 12, s.tide / TIDE_MAX, '#4ade80');
+
+  // Surge button.
+  const b = SURGE_BTN;
+  roundRect(ctx, b.x, b.y, b.w, b.h, 12);
+  if (s.surgeReady) {
+    ctx.fillStyle = '#f5c542';
+    ctx.fill();
+    ctx.fillStyle = '#1a1405';
+  } else {
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    ctx.fill();
+    ctx.fillStyle = '#7d99a6';
+  }
+  ctx.font = '800 19px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(
+    s.surgeReady ? 'SURGE READY — press SPACE' : `TIDE ${s.tide}% — fill it to surge`,
+    b.x + b.w / 2, b.y + 35,
+  );
+  ctx.textAlign = 'left';
+
+  // Reef dots.
+  const dotsY = PANEL.y + PANEL.h - 30;
+  for (let i = 0; i < LEVELS.length; i += 1) {
+    const dx = px + i * 30;
+    ctx.beginPath();
+    ctx.arc(dx + 7, dotsY, 7, 0, Math.PI * 2);
+    if (i < s.level - 1) {
+      ctx.fillStyle = '#ffd968';
+      ctx.fill();
+    } else if (i === s.level - 1) {
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 2;
+      ctx.stroke();
     } else {
-      const shard = SHARDS[type];
-      context.fillStyle = shard.color;
-      context.globalAlpha = alpha * 0.30;
-      roundRect(context, cx - half, cy - half, half * 2, half * 2, 12);
-      context.fill();
-      context.globalAlpha = alpha;
-      context.strokeStyle = shard.color;
-      context.lineWidth = 2.5;
-      roundRect(context, cx - half, cy - half, half * 2, half * 2, 12);
-      context.stroke();
-      drawShape(context, shard.shape, cx, cy, SHAPE_RADIUS, shard.color);
-      context.fillStyle = 'rgba(255, 255, 255, 0.85)';
-      context.beginPath();
-      context.arc(cx, cy, 4, 0, Math.PI * 2);
-      context.fill();
-    }
-    context.restore();
-  }
-
-  function drawBarnacle(col, row) {
-    const cx = BOARD.x + col * BOARD.cell + BOARD.cell / 2;
-    const cy = BOARD.y + row * BOARD.cell + BOARD.cell / 2;
-    context.fillStyle = PALETTE.barnacle;
-    context.beginPath();
-    context.arc(cx - 12, cy + 6, 13, 0, Math.PI * 2);
-    context.arc(cx + 11, cy + 8, 11, 0, Math.PI * 2);
-    context.arc(cx, cy - 10, 12, 0, Math.PI * 2);
-    context.fill();
-    context.strokeStyle = PALETTE.barnacleRim;
-    context.lineWidth = 2;
-    context.beginPath();
-    context.arc(cx, cy, 20, 0, Math.PI * 2);
-    context.stroke();
-    context.fillStyle = 'rgba(255, 255, 255, 0.25)';
-    context.beginPath();
-    context.arc(cx - 8, cy - 8, 3, 0, Math.PI * 2);
-    context.arc(cx + 9, cy - 2, 2, 0, Math.PI * 2);
-    context.fill();
-  }
-
-  function drawBoard(state, ui, fx) {
-    context.fillStyle = PALETTE.board;
-    roundRect(context, BOARD.x - 10, BOARD.y - 10, BOARD.cols * BOARD.cell + 20, BOARD.rows * BOARD.cell + 20, 16);
-    context.fill();
-    context.strokeStyle = PALETTE.boardEdge;
-    context.lineWidth = 2;
-    roundRect(context, BOARD.x - 10, BOARD.y - 10, BOARD.cols * BOARD.cell + 20, BOARD.rows * BOARD.cell + 20, 16);
-    context.stroke();
-    const popKeys = new Map();
-    for (const pop of fx.pops || []) popKeys.set(`${pop.col},${pop.row}`, pop);
-    for (let row = 0; row < BOARD.rows; row += 1) {
-      for (let col = 0; col < BOARD.cols; col += 1) {
-        const cell = state.grid[row][col];
-        if (cell.barnacle) {
-          drawBarnacle(col, row);
-          continue;
-        }
-        if (cell.type < 0) continue;
-        const pop = popKeys.get(`${col},${row}`);
-        if (pop) {
-          drawShard(col, row, cell.type, cell.py, 1 - 0.55 * pop.progress, 1 - 0.45 * pop.progress);
-        } else {
-          drawShard(col, row, cell.type, cell.py, 1, 1);
-        }
-      }
-    }
-    // Selection, keyboard cursor and hover rings, drawn over the shards.
-    if (ui.selection) {
-      const cx = BOARD.x + ui.selection.col * BOARD.cell + BOARD.cell / 2;
-      const cy = BOARD.y + ui.selection.row * BOARD.cell + BOARD.cell / 2;
-      context.strokeStyle = PALETTE.gold;
-      context.lineWidth = 4;
-      roundRect(context, cx - 30, cy - 30, 60, 60, 12);
-      context.stroke();
-    }
-    if (ui.cursor) {
-      const cx = BOARD.x + ui.cursor.col * BOARD.cell + BOARD.cell / 2;
-      const cy = BOARD.y + ui.cursor.row * BOARD.cell + BOARD.cell / 2;
-      context.strokeStyle = 'rgba(238, 247, 245, 0.8)';
-      context.lineWidth = 2;
-      context.setLineDash([6, 5]);
-      roundRect(context, cx - 30, cy - 30, 60, 60, 12);
-      context.stroke();
-      context.setLineDash([]);
-    }
-    if (ui.hoverCell && !ui.selection) {
-      const cx = BOARD.x + ui.hoverCell.col * BOARD.cell + BOARD.cell / 2;
-      const cy = BOARD.y + ui.hoverCell.row * BOARD.cell + BOARD.cell / 2;
-      context.strokeStyle = 'rgba(238, 247, 245, 0.25)';
-      context.lineWidth = 2;
-      roundRect(context, cx - 30, cy - 30, 60, 60, 12);
-      context.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.18)';
+      ctx.fill();
     }
   }
+  ctx.fillStyle = '#8fb3c0';
+  ctx.font = '600 16px system-ui, sans-serif';
+  ctx.fillText(`${s.level} of 5 reefs`, px + LEVELS.length * 30 + 12, dotsY + 6);
+}
 
-  function drawParticles(fx) {
-    for (const p of fx.particles || []) {
-      context.globalAlpha = Math.max(0, p.life / p.maxLife);
-      context.fillStyle = p.color;
-      context.beginPath();
-      context.arc(p.x, p.y, p.size, 0, Math.PI * 2);
-      context.fill();
-    }
-    context.globalAlpha = 1;
+function drawHeader(ctx, world) {
+  const s = world.state;
+  const level = LEVELS[s.level - 1];
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '800 34px system-ui, sans-serif';
+  ctx.fillText('TIDEGLASS', BOARD_X, 72);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#9fc6d4';
+  ctx.font = '600 22px system-ui, sans-serif';
+  ctx.fillText(`REEF ${s.level} · ${level.name}`, FIELD_W / 2, 70);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#8fb3c0';
+  ctx.font = '700 20px system-ui, sans-serif';
+  ctx.fillText(`BEST ${s.best}`, FIELD_W - BOARD_X, 70);
+  ctx.textAlign = 'left';
+}
+
+function drawFooter(ctx, world) {
+  ctx.fillStyle = '#7d99a6';
+  ctx.font = '15px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  const mute = world.muted ? 'M: Unmute' : 'M: Sound';
+  ctx.fillText(
+    `Click two shards to swap · Match 3 or more · 4 in a row makes a Pearl · Space: Surge · P: Pause · R: Restart · ${mute}`,
+    FIELD_W / 2, 712,
+  );
+  ctx.textAlign = 'left';
+}
+
+function drawPopups(ctx, world, now) {
+  const s = world.state;
+  ctx.textAlign = 'center';
+  ctx.font = '800 26px system-ui, sans-serif';
+  for (const p of s.popups) {
+    const rise = (1 - p.life) * 44;
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life));
+    ctx.fillStyle = '#ffd968';
+    ctx.fillText(p.text, p.x, p.y - rise);
   }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'left';
+}
 
-  function drawFloaters(fx) {
-    for (const f of fx.floaters || []) {
-      context.globalAlpha = Math.max(0, f.life / f.maxLife);
-      text(f.text, f.x, f.y, 26, f.color, 'center', '700');
-    }
-    context.globalAlpha = 1;
+function overlayPanel(ctx, x, y, w, h) {
+  ctx.fillStyle = 'rgba(4,18,28,0.72)';
+  ctx.fillRect(0, 0, FIELD_W, FIELD_H);
+  roundRect(ctx, x, y, w, h, 18);
+  ctx.fillStyle = '#0d2733';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+function overlayText(ctx, cx, top, h, lines, prompt) {
+  const y = top + 74;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '800 40px system-ui, sans-serif';
+  ctx.fillText(lines[0], cx, y);
+  ctx.fillStyle = '#b8d4de';
+  ctx.font = '18px system-ui, sans-serif';
+  let ly = y + 38;
+  for (const line of lines.slice(1)) {
+    ctx.fillText(line, cx, ly);
+    ly += 28;
   }
-
-  function drawTopBar(state, ui) {
-    context.textBaseline = 'alphabetic';
-    text('TIDEGLASS', BOARD.x, 46, 34, PALETTE.text, 'left', '800');
-    const level = LEVELS[state.level - 1];
-    text(`REEF ${state.level} · ${level.name}`, FIELD.width / 2, 44, 24, PALETTE.muted, 'center', '600');
-    text(bestLabel(ui.best), FIELD.width - BOARD.x, 44, 24, PALETTE.muted, 'right', '600');
+  if (prompt !== null) {
+    ctx.fillStyle = '#ffd968';
+    ctx.font = '800 20px system-ui, sans-serif';
+    ctx.fillText(prompt, cx, top + h - 44);
   }
+  ctx.textAlign = 'left';
+}
 
-  function drawPanel(state, ui, time) {
-    context.fillStyle = PALETTE.panel;
-    roundRect(context, PANEL.x, PANEL.y, PANEL.width, PANEL.height, 16);
-    context.fill();
-    context.strokeStyle = PALETTE.panelEdge;
-    context.lineWidth = 2;
-    roundRect(context, PANEL.x, PANEL.y, PANEL.width, PANEL.height, 16);
-    context.stroke();
-    const px = PANEL.x + 28;
-    text('SCORE', px, 150, 20, PALETTE.muted, 'left', '600');
-    text(scoreLabel(state.totalScore), px, 200, 54, PALETTE.text, 'left', '800');
-    const level = LEVELS[state.level - 1];
-    text('TARGET', px, 246, 20, PALETTE.muted, 'left', '600');
-    text(levelScoreLabel(state.levelScore), px, 282, 34, state.levelScore >= level.target ? PALETTE.gold : PALETTE.text, 'left', '700');
-    text(`/ ${level.target}`, px + 150, 282, 24, PALETTE.muted, 'left', '600');
-    const barW = PANEL.width - 56;
-    const ratio = Math.min(1, state.levelScore / level.target);
-    context.fillStyle = PALETTE.board;
-    roundRect(context, px, 296, barW, 16, 8);
-    context.fill();
-    context.fillStyle = ratio >= 1 ? PALETTE.gold : PALETTE.tide;
-    if (ratio > 0) {
-      roundRect(context, px, 296, Math.max(16, barW * ratio), 16, 8);
-      context.fill();
-    }
-    text('MOVES LEFT', px, 372, 20, PALETTE.muted, 'left', '600');
-    text(movesLabel(state.moves), px, 424, 56, state.moves <= 5 ? PALETTE.danger : PALETTE.text, 'left', '800');
-    text('TIDE', px, 474, 20, PALETTE.muted, 'left', '600');
-    context.fillStyle = PALETTE.board;
-    roundRect(context, px, 486, barW, 16, 8);
-    context.fill();
-    if (state.tide > 0) {
-      context.fillStyle = PALETTE.tide;
-      roundRect(context, px, 486, Math.max(16, barW * (state.tide / 100)), 16, 8);
-      context.fill();
-    }
-    const ready = state.surgeReady;
-    const pulse = ready ? 0.75 + 0.25 * Math.sin(time * 5) : 1;
-    context.globalAlpha = pulse;
-    context.fillStyle = ready ? PALETTE.gold : PALETTE.boardEdge;
-    roundRect(context, SURGE_BUTTON.x, SURGE_BUTTON.y, SURGE_BUTTON.width, SURGE_BUTTON.height, 12);
-    context.fill();
-    context.globalAlpha = 1;
-    text(ready ? 'SURGE READY — press SPACE' : `TIDE ${state.tide}% — fill it to surge`, SURGE_BUTTON.x + SURGE_BUTTON.width / 2, SURGE_BUTTON.y + 32, 22, ready ? '#0a1a24' : PALETTE.muted, 'center', '700');
-    // Five reef dots: filled for cleared reefs, ringed for the one being played.
-    for (let i = 0; i < LEVELS.length; i += 1) {
-      const cx = px + 12 + i * 34;
-      const cy = 612;
-      if (i < state.level - 1) {
-        context.fillStyle = PALETTE.gold;
-        context.beginPath();
-        context.arc(cx, cy, 8, 0, Math.PI * 2);
-        context.fill();
-      } else if (i === state.level - 1) {
-        context.strokeStyle = PALETTE.tide;
-        context.lineWidth = 3;
-        context.beginPath();
-        context.arc(cx, cy, 8, 0, Math.PI * 2);
-        context.stroke();
-      } else {
-        context.fillStyle = PALETTE.boardEdge;
-        context.beginPath();
-        context.arc(cx, cy, 6, 0, Math.PI * 2);
-        context.fill();
-      }
-    }
-    text(`${state.level} of 5 reefs`, px + 12 + 5 * 34 + 8, 620, 18, PALETTE.muted, 'left', '600');
+// The panel geometry is shared by the four overlays; h is the panel height.
+function panelFor(h) {
+  return { x: BOARD_X, y: 150, w: COLS * CELL, h };
+}
+
+export function draw(ctx, world, view) {
+  const s = world.state;
+  const grad = ctx.createLinearGradient(0, 0, 0, FIELD_H);
+  grad.addColorStop(0, '#0a2531');
+  grad.addColorStop(1, '#06121c');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, FIELD_W, FIELD_H);
+  for (const b of bubbles) {
+    const by = b.y + Math.sin(view.now * b.speed + b.phase) * 14;
+    ctx.globalAlpha = b.alpha;
+    ctx.fillStyle = '#7dd3fc';
+    ctx.beginPath();
+    ctx.arc(b.x, by, b.r, 0, Math.PI * 2);
+    ctx.fill();
   }
+  ctx.globalAlpha = 1;
 
-  function drawBottomHint() {
-    text('Click two shards to swap · Match 3 or more · 4 in a row makes a Pearl · Space: Surge · P: Pause · R: Restart · M: Sound', FIELD.width / 2, 700, 19, PALETTE.muted, 'center', '400');
+  drawHeader(ctx, world);
+  drawBoard(ctx, world, view);
+  drawPanel(ctx, world, view);
+  drawFooter(ctx, world);
+  drawPopups(ctx, world, view.now);
+
+  const cx = BOARD_X + (COLS * CELL) / 2;
+  if (view.screen === 'title') {
+    const p = panelFor(420);
+    overlayPanel(ctx, p.x, p.y, p.w, p.h);
+    overlayText(ctx, cx, p.y, p.h, [
+      'TIDEGLASS',
+      'Restore the reef, one match at a time.',
+      'Swap shards to match 3 or more.',
+      'Four in a row makes a Pearl.',
+      'Fill the Tide meter, then surge',
+      'to sweep a row and a column.',
+      `Clear ${LEVELS[0].target} points in 24 moves`,
+      'to save the first reef.',
+      '',
+      `Best campaign: ${s.best}`,
+    ], 'Press Space or click to start');
+  } else if (view.screen === 'paused') {
+    const p = panelFor(220);
+    overlayPanel(ctx, p.x, p.y, p.w, p.h);
+    overlayText(ctx, cx, p.y, p.h, ['Paused'], 'Press P or click to resume');
+  } else if (view.screen === 'clear') {
+    const p = panelFor(380);
+    overlayPanel(ctx, p.x, p.y, p.w, p.h);
+    const last = s.level >= LEVELS.length;
+    overlayText(ctx, cx, p.y, p.h, [
+      last ? 'Every Reef Restored!' : 'Reef Restored!',
+      `Level score ${s.levelScore} · Move bonus +${s.bonus}`,
+      `Total score ${s.totalScore}`,
+      '',
+      last ? 'The tide is yours. Campaign complete!' : `Next: ${LEVELS[s.level].name}`,
+    ], last ? 'Press Space or click to celebrate' : 'Press Space or click for the next reef');
+  } else if (view.screen === 'over') {
+    const p = panelFor(360);
+    overlayPanel(ctx, p.x, p.y, p.w, p.h);
+    overlayText(ctx, cx, p.y, p.h, [
+      'The Tide Went Out',
+      `Score ${s.levelScore} · Target was ${LEVELS[s.level - 1].target}`,
+      `Best campaign: ${s.best}`,
+      '',
+      'The reef still needs you.',
+    ], 'Try again — press R or click');
+  } else if (view.screen === 'win') {
+    const p = panelFor(300);
+    overlayPanel(ctx, p.x, p.y, p.w, p.h);
+    overlayText(ctx, cx, p.y, p.h, [
+      'Every Reef Restored!',
+      `Final score ${s.totalScore}`,
+      `Best campaign: ${s.best}`,
+    ], 'Press Space or click for the title screen');
   }
-
-  function drawToast(ui) {
-    if (!ui.message) return;
-    text(ui.message, FIELD.width / 2, 92, 24, PALETTE.gold, 'center', '700');
-  }
-
-  function drawOverlay(title, lines, prompt) {
-    context.fillStyle = 'rgba(6, 18, 26, 0.72)';
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    // Centred on the board, so the overlay never covers the side panel's score.
-    const width = 600;
-    const height = 150 + lines.length * 36 + 70;
-    const x = BOARD.x + (BOARD.cols * BOARD.cell) / 2 - width / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    roundRect(context, x, y, width, height, 18);
-    context.fill();
-    context.strokeStyle = PALETTE.panelEdge;
-    context.lineWidth = 2;
-    roundRect(context, x, y, width, height, 18);
-    context.stroke();
-    text(title, x + width / 2, y + 76, 46, PALETTE.text, 'center', '800');
-    for (let i = 0; i < lines.length; i += 1) {
-      text(lines[i], x + width / 2, y + 128 + i * 36, 22, PALETTE.muted, 'center', '400');
-    }
-    text(prompt, x + width / 2, y + height - 38, 24, PALETTE.gold, 'center', '700');
-  }
-
-  /** Paint one frame: background, board, HUD, panel, effects, then the screen's overlay. */
-  function draw(state, screen, ui, fx, time) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawBackground(time);
-    drawBoard(state, ui, fx);
-    drawParticles(fx);
-    drawFloaters(fx);
-    drawTopBar(state, ui);
-    drawPanel(state, ui, time);
-    drawBottomHint();
-    drawToast(ui);
-    if (screen === SCREEN_TITLE) {
-      drawOverlay('TIDEGLASS', [
-        'Restore the reef, one match at a time.',
-        'Swap shards to match 3 or more.',
-        'Four in a row makes a Pearl.',
-        'Fill the Tide meter, then surge',
-        'to sweep a row and a column.',
-        `Clear ${LEVELS[0].target} points in ${MOVES_PER_LEVEL} moves`,
-        'to save the first reef.',
-        '',
-        `Best campaign: ${ui.best}`,
-      ], 'Press Space or click to start');
-    } else if (screen === SCREEN_PAUSED) {
-      drawOverlay('Paused', ['The reef waits for you.'], 'Press P or click to keep playing');
-    } else if (screen === SCREEN_CLEAR) {
-      drawOverlay('Reef Restored!', [
-        `Level score ${ui.clearScore}  ·  Move bonus +${ui.clearBonus}`,
-        `Total score ${ui.totalScore}`,
-        '',
-        state.level < LEVELS.length ? `Next: ${LEVELS[state.level].name}` : '',
-      ], state.level < LEVELS.length ? 'Press Space or click for the next reef' : 'Press Space or click');
-    } else if (screen === SCREEN_OVER) {
-      drawOverlay('The Tide Went Out', [
-        `Score ${ui.totalScore}  ·  Target was ${ui.target}`,
-        `Best campaign: ${ui.best}`,
-        '',
-        'The reef still needs you.',
-      ], 'Try again — press R or click');
-    } else if (screen === SCREEN_WIN) {
-      drawOverlay('The Reef Glows Again', [
-        'All five reefs restored.',
-        `Total score ${ui.totalScore}`,
-        `Best campaign: ${ui.best}`,
-      ], 'Play again — press R or click');
-    }
-    if (ui.muted) {
-      text('Muted', FIELD.width - BOARD.x, 84, 18, PALETTE.muted, 'right', '600');
-    }
-  }
-
-  return { resize, draw, toField };
 }

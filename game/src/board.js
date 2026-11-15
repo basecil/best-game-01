@@ -1,237 +1,455 @@
-// TIDEGLASS — the game's rules and state, with no drawing and no browser in it:
-// the board, swaps, matches, cascades, pearls, barnacles, the tide surge, levels
-// and score. step-like calls return what happened as plain data, so the caller can
-// react (particles, sound, screens) without the board knowing about any of it.
-// Nothing here allocates after createWorld returns, except the small event lists.
-
+// TIDEGLASS rules: an 8x8 board, five shard types, Pearls, barnacles,
+// the Tide meter and the Surge. Pure logic, no drawing, no sound: the
+// browser shell (main.js) and the Node smoke tests drive the same world.
+//
+// A cell is { type, barnacle }. type -1 is an empty slot, 0..4 are the five
+// shards, 5 is a Pearl. A barnacle cell has type -1 and barnacle true: it
+// cannot be swapped or matched, and it pins its column's gravity in place
+// until a match beside it scours it off (+50).
 import {
-  BOARD, BONUS_POINTS, LEVELS, MAX_CASCADE, MOVES_PER_LEVEL, MOVE_BONUS,
-  PEARL, POINTS_PER_SHARD, SHARD_TYPES, TIDE_PER_SHARD,
+  COLS, ROWS, LEVELS, MOVES_PER_LEVEL, POINTS_PER_SHARD,
+  TIDE_PER_SHARD, TIDE_MAX, BARNACLE_POINTS, BONUS_PER_MOVE,
+  PEARL, TYPES,
 } from './config.js';
 
-const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const keyOf = (col, row) => `${col},${row}`;
 
-function key(col, row) {
-  return `${col},${row}`;
-}
-
-export function createWorld(random) {
-  const { cols, rows, cell, x: boardX, y: boardY } = BOARD;
+function blankGrid() {
   const grid = [];
-  for (let row = 0; row < rows; row += 1) {
+  for (let r = 0; r < ROWS; r += 1) {
     const line = [];
-    for (let col = 0; col < cols; col += 1) {
-      line.push({ type: -1, barnacle: false, py: boardY + row * cell });
-    }
+    for (let c = 0; c < COLS; c += 1) line.push({ type: -1, barnacle: false });
     grid.push(line);
   }
+  return grid;
+}
 
+export function createWorld(rng) {
   const state = {
     level: 1,
-    levelScore: 0,
-    totalScore: 0,
     moves: MOVES_PER_LEVEL,
+    grid: blankGrid(),
+    levelScore: 0,
+    banked: 0,
+    totalScore: 0,
+    bonus: 0,
+    levelDone: false,
     tide: 0,
     surgeReady: false,
-    levelStartTotal: 0,
-    grid,
+    best: 0,
+    popups: [],
   };
 
-  function inBounds(col, row) {
-    return col >= 0 && col < cols && row >= 0 && row < rows;
-  }
+  const inBounds = (col, row) => col >= 0 && col < COLS && row >= 0 && row < ROWS;
+  const cellAt = (col, row) => state.grid[row][col];
+  // totalScore is updated incrementally next to levelScore: banked holds
+  // the finished levels, so a clear bonus is added once and never again.
+  const addScore = (gain) => {
+    state.levelScore += gain;
+    state.totalScore += gain;
+  };
 
-  function cellAt(col, row) {
-    return inBounds(col, row) ? grid[row][col] : null;
-  }
-
-  /** The pixel y a shard in `row` rests at; new shards fall in from above it. */
-  function restY(row) {
-    return boardY + row * cell;
-  }
-
-  /** Runs of three or more equal types on a raw type grid; barnacles are -1 and never match. */
-  function findMatchesOn(types) {
-    const runs = [];
-    for (let row = 0; row < rows; row += 1) {
-      let run = 1;
-      for (let col = 1; col <= cols; col += 1) {
-        const same = col < cols && types[row][col] >= 0 && types[row][col] === types[row][col - 1];
-        if (same) run += 1;
-        else {
-          if (run >= 3) {
-            const cells = [];
-            for (let c = col - run; c < col; c += 1) cells.push({ col: c, row });
-            runs.push(cells);
-          }
-          run = 1;
-        }
+  // Types that would not complete a run if placed at (col, row): a type is
+  // bad when two equal neighbours already sit on one side of it, or one
+  // sits on each side. With five types there is always a safe one.
+  function safeTypes(col, row) {
+    const at = (c, r) => (inBounds(c, r) ? cellAt(c, r).type : -1);
+    const bad = new Set();
+    const axes = [
+      [at(col - 1, row), at(col - 2, row), at(col + 1, row), at(col + 2, row)],
+      [at(col, row - 1), at(col, row - 2), at(col, row + 1), at(col, row + 2)],
+    ];
+    for (const [a1, a2, b1, b2] of axes) {
+      for (const t of [a1, a2, b1, b2]) {
+        if (t < 0 || t >= PEARL) continue;
+        if ((a1 === t && a2 === t) || (b1 === t && b2 === t) || (a1 === t && b1 === t)) bad.add(t);
       }
     }
-    for (let col = 0; col < cols; col += 1) {
-      let run = 1;
-      for (let row = 1; row <= rows; row += 1) {
-        const same = row < rows && types[row][col] >= 0 && types[row][col] === types[row - 1][col];
-        if (same) run += 1;
-        else {
-          if (run >= 3) {
-            const cells = [];
-            for (let r = row - run; r < row; r += 1) cells.push({ col, row: r });
-            runs.push(cells);
-          }
-          run = 1;
+    const out = [];
+    for (let t = 0; t < TYPES; t += 1) if (!bad.has(t)) out.push(t);
+    if (out.length > 0) return out;
+    // Fallback: any type unlike all four direct neighbours (always exists).
+    const near = new Set([at(col - 1, row), at(col + 1, row), at(col, row - 1), at(col, row + 1)]);
+    for (let t = 0; t < TYPES; t += 1) if (!near.has(t)) out.push(t);
+    return out;
+  }
+
+  // Runs of three or more equal shards, in rows and in columns. Pearls
+  // and barnacles never match.
+  function findMatches(grid = state.grid) {
+    const groups = [];
+    for (let r = 0; r < ROWS; r += 1) {
+      let c = 0;
+      while (c < COLS) {
+        const t = grid[r][c].type;
+        if (t < 0 || t >= PEARL) { c += 1; continue; }
+        let end = c + 1;
+        while (end < COLS && grid[r][end].type === t) end += 1;
+        if (end - c >= 3) {
+          const cells = [];
+          for (let x = c; x < end; x += 1) cells.push({ col: x, row: r });
+          groups.push({ cells, dir: 'h', type: t });
         }
+        c = end;
       }
     }
-    return runs;
-  }
-
-  function typesGrid() {
-    return grid.map((line) => line.map((c) => (c.barnacle ? -1 : c.type)));
-  }
-
-  function findMatches() {
-    return findMatchesOn(typesGrid());
-  }
-
-  /** A type for (col, row) that starts no match with what is already placed. */
-  function safeType(col, row, types) {
-    for (let tries = 0; tries < 20; tries += 1) {
-      const type = Math.floor(random() * SHARD_TYPES);
-      const left = col >= 2 && types[row][col - 1] === type && types[row][col - 2] === type;
-      const up = row >= 2 && types[row - 1][col] === type && types[row - 2][col] === type;
-      if (!left && !up) return type;
+    for (let c = 0; c < COLS; c += 1) {
+      let r = 0;
+      while (r < ROWS) {
+        const t = grid[r][c].type;
+        if (t < 0 || t >= PEARL) { r += 1; continue; }
+        let end = r + 1;
+        while (end < ROWS && grid[end][c].type === t) end += 1;
+        if (end - r >= 3) {
+          const cells = [];
+          for (let y = r; y < end; y += 1) cells.push({ col: c, row: y });
+          groups.push({ cells, dir: 'v', type: t });
+        }
+        r = end;
+      }
     }
-    return Math.floor(random() * SHARD_TYPES);
+    return groups;
   }
 
-  function fillFresh() {
-    const types = [];
-    for (let row = 0; row < rows; row += 1) {
-      types.push(new Array(cols).fill(-1));
-      for (let col = 0; col < cols; col += 1) types[row][col] = safeType(col, row, types);
-    }
-    return types;
-  }
-
-  function placeBarnacles(count) {
-    const spots = [];
-    let guard = 0;
-    while (spots.length < count && guard < 500) {
-      guard += 1;
-      const col = Math.floor(random() * cols);
-      const row = Math.floor(random() * rows);
-      if (spots.some((s) => s.col === col && s.row === row)) continue;
-      spots.push({ col, row });
-    }
-    return spots;
-  }
-
-  /**
-   * The cells a pearl sweeps when it lands on `at`: its row and its column.
-   * The set is the same before and after the swap that moves it there.
-   */
-  function pearlCells(at) {
-    const cells = [];
-    for (let c = 0; c < cols; c += 1) {
-      const cell = cellAt(c, at.row);
-      if (cell && !cell.barnacle && cell.type >= 0) cells.push({ col: c, row: at.row });
-    }
-    for (let r = 0; r < rows; r += 1) {
-      if (r === at.row) continue;
-      const cell = cellAt(at.col, r);
-      if (cell && !cell.barnacle && cell.type >= 0) cells.push({ col: at.col, row: r });
-    }
-    return cells;
-  }
-
-  function wholeBoardCells() {
-    const cells = [];
-    for (let r = 0; r < rows; r += 1) {
-      for (let c = 0; c < cols; c += 1) {
+  // Fill every empty slot with a safe type, then re-roll any cell that is
+  // still part of a match until the board is clean.
+  function fillEmpty() {
+    for (let r = 0; r < ROWS; r += 1) {
+      for (let c = 0; c < COLS; c += 1) {
         const cell = cellAt(c, r);
-        if (cell && !cell.barnacle && cell.type >= 0) cells.push({ col: c, row: r });
+        if (cell.barnacle || cell.type !== -1) continue;
+        const ok = safeTypes(c, r);
+        cell.type = ok[rng.int(ok.length)];
       }
+    }
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const groups = findMatches();
+      if (groups.length === 0) return;
+      for (const g of groups) {
+        for (const p of g.cells) {
+          const cell = cellAt(p.col, p.row);
+          const ok = safeTypes(p.col, p.row);
+          if (ok.length > 0) cell.type = ok[rng.int(ok.length)];
+        }
+      }
+    }
+  }
+
+  // Gravity, one column at a time: barnacles split a column into segments
+  // and each segment compacts to its own bottom, then refills safely.
+  function settle() {
+    for (let c = 0; c < COLS; c += 1) {
+      let r = ROWS - 1;
+      while (r >= 0) {
+        if (cellAt(c, r).barnacle) { r -= 1; continue; }
+        let top = r;
+        while (top >= 0 && !cellAt(c, top).barnacle) top -= 1;
+        top += 1;
+        const stack = [];
+        for (let y = r; y >= top; y -= 1) {
+          const t = cellAt(c, y).type;
+          if (t !== -1) stack.push(t);
+        }
+        let y = r;
+        for (const t of stack) { cellAt(c, y).type = t; y -= 1; }
+        for (; y >= top; y -= 1) cellAt(c, y).type = -1;
+        r = top - 1;
+      }
+    }
+    fillEmpty();
+  }
+
+  // Score a list of cleared cells at a cascade depth: 10 per shard, plus
+  // 50 for every barnacle scoured off beside them. Returns the gain and
+  // the barnacles cleared. The cells themselves are NOT emptied here.
+  function scoreClear(list, depth) {
+    let gain = POINTS_PER_SHARD * list.length * depth;
+    const barnaclesCleared = [];
+    for (const p of list) {
+      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nc = p.col + dc;
+        const nr = p.row + dr;
+        if (!inBounds(nc, nr)) continue;
+        const nb = cellAt(nc, nr);
+        if (nb.barnacle) {
+          nb.barnacle = false;
+          nb.type = -1;
+          gain += BARNACLE_POINTS;
+          barnaclesCleared.push({ col: nc, row: nr });
+        }
+      }
+    }
+    state.tide = Math.min(TIDE_MAX, state.tide + TIDE_PER_SHARD * list.length);
+    if (state.tide >= TIDE_MAX) state.surgeReady = true;
+    return { gain, barnaclesCleared };
+  }
+
+  // Clear every match on the board, round after round, until it is clean.
+  // A run of four or more leaves a Pearl behind on one of its cells.
+  // Returns the totals for the whole cascade.
+  function resolve(swapped, startDepth = 1) {
+    let scoreGain = 0;
+    let clearedAll = [];
+    let pearlsCreated = [];
+    let barnaclesCleared = [];
+    let depth = startDepth;
+    let firstCleared = 0;
+    for (;;) {
+      const groups = findMatches();
+      if (groups.length === 0) break;
+      const pearlKeys = new Set();
+      const pearlCells = [];
+      for (const g of groups) {
+        if (g.cells.length < 4) continue;
+        const cand = g.cells.find((p) => swapped
+          && ((p.col === swapped.a.col && p.row === swapped.a.row)
+            || (p.col === swapped.b.col && p.row === swapped.b.row)))
+          ?? g.cells[Math.floor(g.cells.length / 2)];
+        pearlKeys.add(keyOf(cand.col, cand.row));
+        pearlCells.push(cand);
+      }
+      const cleared = new Map();
+      for (const g of groups) {
+        for (const p of g.cells) {
+          if (!pearlKeys.has(keyOf(p.col, p.row))) cleared.set(keyOf(p.col, p.row), p);
+        }
+      }
+      const list = [...cleared.values()];
+      if (depth === startDepth) firstCleared = list.length;
+      const scored = scoreClear(list, depth);
+      scoreGain += scored.gain;
+      barnaclesCleared.push(...scored.barnaclesCleared);
+      for (const p of list) cellAt(p.col, p.row).type = -1;
+      for (const p of pearlCells) {
+        cellAt(p.col, p.row).type = PEARL;
+        pearlsCreated.push({ col: p.col, row: p.row });
+      }
+      clearedAll.push(...list);
+      settle();
+      depth += 1;
+      if (depth > 50) break;
+    }
+    return {
+      scoreGain, cleared: clearedAll, pearlsCreated, barnaclesCleared,
+      depth: depth - startDepth, firstCleared,
+    };
+  }
+
+  // The cells a Pearl sweep clears: a row and a column, or the whole board
+  // when two Pearls meet.
+  function sweepCells(target, wholeBoard) {
+    const cells = [];
+    const seen = new Set();
+    const add = (col, row) => {
+      if (!inBounds(col, row)) return;
+      const cell = cellAt(col, row);
+      if (cell.barnacle || cell.type === -1) return;
+      const k = keyOf(col, row);
+      if (seen.has(k)) return;
+      seen.add(k);
+      cells.push({ col, row });
+    };
+    if (wholeBoard) {
+      for (let r = 0; r < ROWS; r += 1) for (let c = 0; c < COLS; c += 1) add(c, r);
+    } else {
+      for (let c = 0; c < COLS; c += 1) add(c, target.row);
+      for (let r = 0; r < ROWS; r += 1) add(target.col, r);
     }
     return cells;
   }
 
-  /** True when some swap on the board as it stands would make a match (pearls count). */
+  // Shared ending for a scoring action: bonus on a clear, game over when
+  // the moves are spent below target.
+  function finish(res, kind) {
+    let levelClear = false;
+    let gameOver = false;
+    if (!state.levelDone && state.levelScore >= LEVELS[state.level - 1].target) {
+      levelClear = true;
+      state.levelDone = true;
+      state.bonus = BONUS_PER_MOVE * state.moves;
+      state.totalScore += state.bonus;
+      state.banked = state.totalScore;
+    } else if (!state.levelDone && state.moves <= 0) {
+      gameOver = true;
+    }
+    return {
+      ok: true, kind, scoreGain: res.scoreGain, cleared: res.cleared,
+      depth: res.depth, pearlsCreated: res.pearlsCreated,
+      barnaclesCleared: res.barnaclesCleared, levelClear, gameOver,
+    };
+  }
+
+  const failEvent = (kind) => ({
+    ok: false, kind, scoreGain: 0, cleared: [], depth: 0,
+    pearlsCreated: [], barnaclesCleared: [], levelClear: false, gameOver: false,
+  });
+
+  function pearlSwap(a, b) {
+    const ca = cellAt(a.col, a.row);
+    const cb = cellAt(b.col, b.row);
+    const both = ca.type === PEARL && cb.type === PEARL;
+    const target = ca.type === PEARL ? b : a;
+    const cells = sweepCells(target, both);
+    const scored = scoreClear(cells, 1);
+    for (const p of cells) cellAt(p.col, p.row).type = -1;
+    settle();
+    const casc = resolve(null, 2);
+    const res = {
+      scoreGain: scored.gain + casc.scoreGain,
+      cleared: [...cells, ...casc.cleared],
+      pearlsCreated: casc.pearlsCreated,
+      barnaclesCleared: [...scored.barnaclesCleared, ...casc.barnaclesCleared],
+      depth: Math.max(1, casc.depth + 1),
+      firstCleared: cells.length,
+    };
+    addScore(res.scoreGain);
+    state.moves -= 1;
+    return finish(res, both ? 'pearl-board' : 'pearl');
+  }
+
+  function swapCells(a, b) {
+    if (!inBounds(a.col, a.row) || !inBounds(b.col, b.row)) return failEvent('invalid');
+    if (Math.abs(a.col - b.col) + Math.abs(a.row - b.row) !== 1) return failEvent('invalid');
+    const ca = cellAt(a.col, a.row);
+    const cb = cellAt(b.col, b.row);
+    if (ca.barnacle || cb.barnacle) return failEvent('invalid');
+    if (ca.type === PEARL || cb.type === PEARL) return pearlSwap(a, b);
+    const tmp = ca.type;
+    ca.type = cb.type;
+    cb.type = tmp;
+    if (findMatches().length === 0) {
+      const back = ca.type;
+      ca.type = cb.type;
+      cb.type = back;
+      return failEvent('nomatch');
+    }
+    const res = resolve({ a, b });
+    addScore(res.scoreGain);
+    state.moves -= 1;
+    return finish(res, 'match');
+  }
+
+  // The Surge: one random row and one random column, at no move cost.
+  function surge() {
+    if (!state.surgeReady || state.tide < TIDE_MAX) return failEvent('not-ready');
+    const target = { col: rng.int(COLS), row: rng.int(ROWS) };
+    const cells = sweepCells(target, false);
+    const scored = scoreClear(cells, 1);
+    for (const p of cells) cellAt(p.col, p.row).type = -1;
+    settle();
+    const casc = resolve(null, 2);
+    const res = {
+      scoreGain: scored.gain + casc.scoreGain,
+      cleared: [...cells, ...casc.cleared],
+      pearlsCreated: casc.pearlsCreated,
+      barnaclesCleared: [...scored.barnaclesCleared, ...casc.barnaclesCleared],
+      depth: Math.max(1, casc.depth + 1),
+      firstCleared: cells.length,
+    };
+    addScore(res.scoreGain);
+    state.tide = 0;
+    state.surgeReady = false;
+    return finish(res, 'surge');
+  }
+
+  // Simulate one swap on a scratch copy of the board and report what it
+  // would score. The real board, tide and surge state are restored after.
+  function simulateSwap(a, b) {
+    const savedGrid = state.grid;
+    const savedTide = state.tide;
+    const savedSurge = state.surgeReady;
+    state.grid = savedGrid.map((line) => line.map((c) => ({ type: c.type, barnacle: c.barnacle })));
+    let out = null;
+    try {
+      const ca = cellAt(a.col, a.row);
+      const cb = cellAt(b.col, b.row);
+      if (ca.type === PEARL || cb.type === PEARL) {
+        const both = ca.type === PEARL && cb.type === PEARL;
+        const target = ca.type === PEARL ? b : a;
+        const cells = sweepCells(target, both);
+        const scored = scoreClear(cells, 1);
+        for (const p of cells) cellAt(p.col, p.row).type = -1;
+        settle();
+        const casc = resolve(null, 2);
+        out = { gain: scored.gain + casc.scoreGain, first: cells.length, pearls: casc.pearlsCreated.length };
+      } else {
+        const tmp = ca.type;
+        ca.type = cb.type;
+        cb.type = tmp;
+        if (findMatches().length > 0) {
+          const res = resolve({ a, b });
+          out = { gain: res.scoreGain, first: res.firstCleared, pearls: res.pearlsCreated.length };
+        }
+      }
+    } finally {
+      state.grid = savedGrid;
+      state.tide = savedTide;
+      state.surgeReady = savedSurge;
+    }
+    return out;
+  }
+
+  // The best swap on the board by simulated score, or null when the board
+  // is deadlocked. Used by the autopilot and by the deadlock check.
   function findBestSwap() {
-    const types = typesGrid();
     let best = null;
-    for (let row = 0; row < rows; row += 1) {
-      for (let col = 0; col < cols; col += 1) {
-        if (types[row][col] < 0) continue;
+    for (let r = 0; r < ROWS; r += 1) {
+      for (let c = 0; c < COLS; c += 1) {
+        const cell = cellAt(c, r);
+        if (cell.barnacle) continue;
         for (const [dc, dr] of [[1, 0], [0, 1]]) {
-          const nc = col + dc;
-          const nr = row + dr;
-          if (!inBounds(nc, nr) || types[nr][nc] < 0) continue;
-          const a = types[row][col];
-          const b = types[nr][nc];
-          let matched = 0;
-          if (a === PEARL && b === PEARL) matched = cols * rows;
-          else if (a === PEARL || b === PEARL) {
-            // The pearl lands on its neighbour's cell and sweeps that row and column.
-            const landing = a === PEARL ? { col: nc, row: nr } : { col, row };
-            matched = pearlCells(landing).length;
-          } else {
-            types[row][col] = b;
-            types[nr][nc] = a;
-            for (const run of findMatchesOn(types)) matched += run.length;
-            types[row][col] = a;
-            types[nr][nc] = b;
-          }
-          if (matched > 0 && (best === null || matched > best.matched)) {
-            best = { a: { col, row }, b: { col: nc, row: nr }, matched };
+          const nc = c + dc;
+          const nr = r + dr;
+          if (!inBounds(nc, nr)) continue;
+          const nb = cellAt(nc, nr);
+          if (nb.barnacle) continue;
+          const a = { col: c, row: r };
+          const b = { col: nc, row: nr };
+          const sim = simulateSwap(a, b);
+          if (sim === null) continue;
+          // A Pearl left on the board is worth about a row-and-column
+          // sweep later, so creating one counts toward the swap's value
+          // even though the points land on a later move.
+          const value = sim.gain + 100 * sim.pearls;
+          if (best === null || value > best.value
+            || (value === best.value && sim.first > best.first)) {
+            best = { a, b, matched: sim.first, value };
           }
         }
       }
     }
-    return best;
+    return best === null ? null : { a: best.a, b: best.b, matched: best.matched };
   }
 
   function hasMoves() {
-    return findBestSwap() !== null;
+    return state.moves > 0 && findBestSwap() !== null;
   }
 
-  /** Shuffle the shards (barnacles stay) until the board has a move and no match. */
+  // Shuffle the shards until a legal swap exists and nothing is matched.
   function reshuffle() {
-    for (let tries = 0; tries < 60; tries += 1) {
-      const types = fillFresh();
-      let ok = true;
-      for (let row = 0; row < rows; row += 1) {
-        for (let col = 0; col < cols; col += 1) {
-          if (!grid[row][col].barnacle) grid[row][col].type = types[row][col];
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const types = [];
+      for (let r = 0; r < ROWS; r += 1) {
+        for (let c = 0; c < COLS; c += 1) {
+          const cell = cellAt(c, r);
+          if (!cell.barnacle) types.push(cell.type);
         }
       }
-      if (findMatches().length > 0) ok = false;
-      if (ok && hasMoves()) {
-        for (let row = 0; row < rows; row += 1) {
-          for (let col = 0; col < cols; col += 1) grid[row][col].py = restY(row);
-        }
-        return true;
+      for (let i = types.length - 1; i > 0; i -= 1) {
+        const j = rng.int(i + 1);
+        [types[i], types[j]] = [types[j], types[i]];
       }
+      let k = 0;
+      for (let r = 0; r < ROWS; r += 1) {
+        for (let c = 0; c < COLS; c += 1) {
+          const cell = cellAt(c, r);
+          if (!cell.barnacle) cell.type = types[k++];
+        }
+      }
+      fillEmpty();
+      if (findMatches().length === 0 && findBestSwap() !== null) return true;
     }
     return false;
-  }
-
-  function generate(level) {
-    for (let tries = 0; tries < 60; tries += 1) {
-      const types = fillFresh();
-      for (let row = 0; row < rows; row += 1) {
-        for (let col = 0; col < cols; col += 1) {
-          grid[row][col].type = types[row][col];
-          grid[row][col].barnacle = false;
-          grid[row][col].py = restY(row);
-        }
-      }
-      for (const spot of placeBarnacles(LEVELS[level - 1].barnacles)) {
-        grid[spot.row][spot.col].barnacle = true;
-        grid[spot.row][spot.col].type = -1;
-      }
-      if (findMatches().length === 0 && hasMoves()) return;
-    }
   }
 
   function reset(level) {
@@ -240,337 +458,56 @@ export function createWorld(random) {
     state.moves = MOVES_PER_LEVEL;
     state.tide = 0;
     state.surgeReady = false;
-    state.levelStartTotal = state.totalScore;
-    generate(level);
+    state.bonus = 0;
+    state.levelDone = false;
+    state.totalScore = state.banked;
+    state.popups.length = 0;
+    state.grid = blankGrid();
+    const count = LEVELS[level - 1].barnacles;
+    const spots = [];
+    for (let r = 0; r < ROWS; r += 1) {
+      for (let c = 0; c < COLS; c += 1) spots.push({ col: c, row: r });
+    }
+    for (let i = spots.length - 1; i > 0; i -= 1) {
+      const j = rng.int(i + 1);
+      [spots[i], spots[j]] = [spots[j], spots[i]];
+    }
+    for (let i = 0; i < count; i += 1) {
+      const s = spots[i];
+      cellAt(s.col, s.row).barnacle = true;
+    }
+    fillEmpty();
+    if (findBestSwap() === null) reshuffle();
   }
 
   function startCampaign() {
+    state.banked = 0;
     state.totalScore = 0;
     reset(1);
   }
 
-  function retryLevel() {
-    state.totalScore = state.levelStartTotal;
-    reset(state.level);
-  }
-
   function nextLevel() {
+    if (state.level >= LEVELS.length) return false;
+    state.banked = state.totalScore;
     reset(state.level + 1);
+    return true;
   }
 
-  /**
-   * A refill type for (col, row) that starts no match with what is already
-   * there: two to the left and two below are settled by the time a cell is
-   * filled, so a fresh shard never lands already matched. Cascades still
-   * happen — falling shards align as they land — but a refill never hands
-   * the player a free chain.
-   */
-  function safeRefillType(col, row) {
-    for (let tries = 0; tries < 20; tries += 1) {
-      const type = Math.floor(random() * SHARD_TYPES);
-      const left = col >= 2 && grid[row][col - 1].type === type && grid[row][col - 2].type === type;
-      const below = row + 2 < rows && grid[row + 1][col].type === type && grid[row + 2][col].type === type;
-      if (!left && !below) return type;
-    }
-    return Math.floor(random() * SHARD_TYPES);
-  }
-
-  /** Let shards fall: compact each column, refill the top with fresh shards. */
-  function applyGravity() {
-    for (let col = 0; col < cols; col += 1) {
-      let write = rows - 1;
-      for (let row = rows - 1; row >= 0; row -= 1) {
-        const c = grid[row][col];
-        if (c.type >= 0) {
-          if (write !== row) {
-            grid[write][col].type = c.type;
-            grid[write][col].barnacle = false;
-            grid[write][col].py = c.py;
-            c.type = -1;
-          }
-          write -= 1;
-        }
-      }
-      let fresh = 0;
-      for (let row = write; row >= 0; row -= 1) {
-        const c = grid[row][col];
-        if (c.barnacle) continue;
-        c.type = safeRefillType(col, row);
-        fresh += 1;
-        c.py = boardY + (row - fresh) * cell;
-      }
-    }
-  }
-
-  function addTide(clearedCount) {
-    state.tide = Math.min(100, state.tide + clearedCount * TIDE_PER_SHARD);
-    state.surgeReady = state.tide >= 100;
-  }
-
-  function addScore(points) {
-    state.levelScore += points;
-    state.totalScore += points;
-  }
-
-  /**
-   * Clear waves until the board settles. `first` is an optional opening clear
-   * (a pearl swap or a surge): { cells, rate } scores those cells at `rate`
-   * each and creates no pearl from them. Without it the first wave is whatever
-   * the board already matches, scored at POINTS_PER_SHARD times the wave's
-   * depth, with a run of four or more leaving a pearl behind. Returns the
-   * event data for the caller.
-   */
-  function resolve(first) {
-    const cleared = [];
-    const pearlsCreated = [];
-    const barnaclesCleared = [];
-    let scoreGain = 0;
-    let depth = 0;
-    let opening = first || null;
-    for (let wave = 0; wave < MAX_CASCADE; wave += 1) {
-      let runs;
-      let rate;
-      let makePearls;
-      if (opening) {
-        runs = [opening.cells];
-        rate = opening.rate;
-        makePearls = false;
-        opening = null;
-      } else {
-        runs = findMatches();
-        if (runs.length === 0) break;
-        rate = POINTS_PER_SHARD * (wave + 1);
-        makePearls = true;
-      }
-      depth = wave + 1;
-      const waveCells = [];
-      const pearlSpots = [];
-      for (const run of runs) {
-        for (const at of run) waveCells.push(at);
-        if (makePearls && run.length >= 4) pearlSpots.push(run[Math.floor(run.length / 2)]);
-      }
-      const seen = new Set();
-      const unique = [];
-      for (const at of waveCells) {
-        const k = key(at.col, at.row);
-        if (!seen.has(k)) {
-          seen.add(k);
-          unique.push(at);
-        }
-      }
-      const pearlKeys = new Set(pearlSpots.map((at) => key(at.col, at.row)));
-      for (const at of unique) {
-        const c = cellAt(at.col, at.row);
-        if (!c || c.type < 0) continue;
-        if (pearlKeys.has(key(at.col, at.row))) {
-          c.type = PEARL;
-          c.py = restY(at.row);
-          pearlsCreated.push({ col: at.col, row: at.row });
-          scoreGain += BONUS_POINTS;
-          addScore(BONUS_POINTS);
-          continue;
-        }
-        cleared.push({ col: at.col, row: at.row, type: c.type });
-        scoreGain += rate;
-        addScore(rate);
-        c.type = -1;
-      }
-      addTide(unique.length);
-      // A match beside a barnacle scours it off the board.
-      for (const at of unique) {
-        for (const [dc, dr] of DIRS) {
-          const n = cellAt(at.col + dc, at.row + dr);
-          if (n && n.barnacle) {
-            n.barnacle = false;
-            n.type = -1;
-            barnaclesCleared.push({ col: at.col + dc, row: at.row + dr });
-            scoreGain += BONUS_POINTS;
-            addScore(BONUS_POINTS);
-          }
-        }
-      }
-      applyGravity();
-    }
-    let reshuffled = false;
-    if (findMatches().length === 0 && !hasMoves()) reshuffled = reshuffle();
-    return { cleared, pearlsCreated, barnaclesCleared, scoreGain, depth, reshuffled };
-  }
-
-  function levelStatus() {
-    const target = LEVELS[state.level - 1].target;
-    if (state.levelScore >= target) {
-      const bonus = state.moves * MOVE_BONUS;
-      state.totalScore += bonus;
-      return { levelClear: true, bonus };
-    }
-    if (state.moves <= 0) return { gameOver: true, bonus: 0 };
-    return { levelClear: false, gameOver: false, bonus: 0 };
-  }
-
-  function swapCells(a, b) {
-    const fail = { ok: false, cleared: [], scoreGain: 0, depth: 0, pearlsCreated: [], barnaclesCleared: [], reshuffled: false, levelClear: false, gameOver: false, bonus: 0 };
-    if (!inBounds(a.col, a.row) || !inBounds(b.col, b.row)) return fail;
-    if (Math.abs(a.col - b.col) + Math.abs(a.row - b.row) !== 1) return fail;
-    const ca = cellAt(a.col, a.row);
-    const cb = cellAt(b.col, b.row);
-    if (!ca || !cb || ca.barnacle || cb.barnacle || ca.type < 0 || cb.type < 0) return fail;
-    const ta = ca.type;
-    const tb = cb.type;
-    ca.type = tb;
-    cb.type = ta;
-    // A pearl sweeps the row and column it lands on; two pearls clear the board.
-    if (ta === PEARL || tb === PEARL) {
-      const bothPearls = ta === PEARL && tb === PEARL;
-      const landing = ta === PEARL ? b : a;
-      const cells = bothPearls ? wholeBoardCells() : pearlCells(landing);
-      state.moves -= 1;
-      const result = resolve({ cells, rate: POINTS_PER_SHARD });
-      const status = levelStatus();
-      return {
-        ok: true, kind: 'pearl', cleared: result.cleared, scoreGain: result.scoreGain,
-        depth: result.depth, pearlsCreated: result.pearlsCreated, barnaclesCleared: result.barnaclesCleared,
-        reshuffled: result.reshuffled, levelClear: status.levelClear, gameOver: status.gameOver, bonus: status.bonus,
-      };
-    }
-    if (findMatches().length === 0) {
-      ca.type = ta;
-      cb.type = tb;
-      return fail;
-    }
-    state.moves -= 1;
-    const result = resolve(null);
-    const status = levelStatus();
-    return {
-      ok: true, kind: 'swap', cleared: result.cleared, scoreGain: result.scoreGain,
-      depth: result.depth, pearlsCreated: result.pearlsCreated, barnaclesCleared: result.barnaclesCleared,
-      reshuffled: result.reshuffled, levelClear: status.levelClear, gameOver: status.gameOver, bonus: status.bonus,
-    };
-  }
-
-  /** Swap two cells and report the match it would make, without clearing anything. */
-  function previewSwap(a, b) {
-    if (!inBounds(a.col, a.row) || !inBounds(b.col, b.row)) return { ok: false, runs: [], points: 0 };
-    if (Math.abs(a.col - b.col) + Math.abs(a.row - b.row) !== 1) return { ok: false, runs: [], points: 0 };
-    const ca = cellAt(a.col, a.row);
-    const cb = cellAt(b.col, b.row);
-    if (!ca || !cb || ca.barnacle || cb.barnacle || ca.type < 0 || cb.type < 0) return { ok: false, runs: [], points: 0 };
-    const ta = ca.type;
-    const tb = cb.type;
-    if (ta === PEARL || tb === PEARL) {
-      const bothPearls = ta === PEARL && tb === PEARL;
-      const landing = ta === PEARL ? b : a;
-      const run = bothPearls ? wholeBoardCells() : pearlCells(landing);
-      return { ok: run.length > 0, runs: [run], points: run.length * POINTS_PER_SHARD };
-    }
-    ca.type = tb;
-    cb.type = ta;
-    const runs = findMatches();
-    ca.type = ta;
-    cb.type = tb;
-    let points = 0;
-    for (const run of runs) points += run.length * POINTS_PER_SHARD;
-    return { ok: runs.length > 0, runs, points };
-  }
-
-  /**
-   * The tide surge: when the meter is full, one random row and one random
-   * column are swept clear, barnacles in their path included. Costs no move.
-   */
-  function surge() {
-    const fail = { ok: false, cleared: [], scoreGain: 0, depth: 0, pearlsCreated: [], barnaclesCleared: [], reshuffled: false, levelClear: false, gameOver: false, bonus: 0 };
-    if (!state.surgeReady) return fail;
-    const row = Math.floor(random() * rows);
-    const col = Math.floor(random() * cols);
-    const cells = [];
-    const pathBarnacles = [];
-    for (let c = 0; c < cols; c += 1) {
-      const at = cellAt(c, row);
-      if (at && at.type >= 0) cells.push({ col: c, row });
-    }
-    for (let r = 0; r < rows; r += 1) {
-      if (r === row) continue;
-      const at = cellAt(col, r);
-      if (at && at.type >= 0) cells.push({ col, row: r });
-    }
-    for (let r = 0; r < rows; r += 1) {
-      for (let c = 0; c < cols; c += 1) {
-        const at = cellAt(c, r);
-        if (at && at.barnacle && (r === row || c === col)) {
-          pathBarnacles.push({ col: c, row: r });
-          at.barnacle = false;
-          at.type = -1;
-        }
-      }
-    }
-    state.tide = 0;
-    state.surgeReady = false;
-    const barnacleGain = pathBarnacles.length * BONUS_POINTS;
-    addScore(barnacleGain);
-    if (cells.length === 0) {
-      const status = levelStatus();
-      return { ok: true, kind: 'surge', cleared: [], scoreGain: barnacleGain, depth: 0, pearlsCreated: [], barnaclesCleared: pathBarnacles, reshuffled: false, levelClear: status.levelClear, gameOver: status.gameOver, bonus: status.bonus };
-    }
-    const result = resolve({ cells, rate: POINTS_PER_SHARD });
-    const status = levelStatus();
-    return {
-      ok: true, kind: 'surge', cleared: result.cleared, scoreGain: result.scoreGain + barnacleGain,
-      depth: result.depth, pearlsCreated: result.pearlsCreated, barnaclesCleared: [...result.barnaclesCleared, ...pathBarnacles],
-      reshuffled: result.reshuffled, levelClear: status.levelClear, gameOver: status.gameOver, bonus: status.bonus,
-    };
-  }
-
-  /**
-   * Swap two cells and leave the swap in place, reporting the match it makes,
-   * without clearing anything or spending a move. The screenshot scenes use it
-   * to freeze a frame mid-match.
-   */
-  function applySwap(a, b) {
-    if (!inBounds(a.col, a.row) || !inBounds(b.col, b.row)) return { ok: false, runs: [], points: 0 };
-    if (Math.abs(a.col - b.col) + Math.abs(a.row - b.row) !== 1) return { ok: false, runs: [], points: 0 };
-    const ca = cellAt(a.col, a.row);
-    const cb = cellAt(b.col, b.row);
-    if (!ca || !cb || ca.barnacle || cb.barnacle || ca.type < 0 || cb.type < 0) return { ok: false, runs: [], points: 0 };
-    const ta = ca.type;
-    const tb = cb.type;
-    if (ta === PEARL || tb === PEARL) {
-      const bothPearls = ta === PEARL && tb === PEARL;
-      const landing = ta === PEARL ? b : a;
-      const run = bothPearls ? wholeBoardCells() : pearlCells(landing);
-      ca.type = tb;
-      cb.type = ta;
-      return { ok: run.length > 0, runs: [run], points: run.length * POINTS_PER_SHARD };
-    }
-    ca.type = tb;
-    cb.type = ta;
-    const runs = findMatches();
-    let points = 0;
-    for (const run of runs) points += run.length * POINTS_PER_SHARD;
-    return { ok: runs.length > 0, runs, points };
-  }
-
-  /** Snap every shard to its resting row (screenshot scenes paint settled boards). */
-  function snap() {
-    for (let row = 0; row < rows; row += 1) {
-      for (let col = 0; col < cols; col += 1) grid[row][col].py = restY(row);
-    }
+  function retryLevel() {
+    reset(state.level);
   }
 
   return {
     state,
-    cellAt,
-    inBounds,
-    restY,
-    reset,
     startCampaign,
-    retryLevel,
+    reset,
     nextLevel,
-    swapCells,
-    previewSwap,
-    applySwap,
-    surge,
-    findBestSwap,
+    retryLevel,
     hasMoves,
     findMatches,
-    snap,
+    findBestSwap,
+    swapCells,
+    surge,
+    reshuffle,
   };
 }

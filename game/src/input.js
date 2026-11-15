@@ -1,67 +1,66 @@
-// TIDEGLASS — mouse and keyboard, read every frame. Clicks, drags and key
-// presses queue up and are taken once per frame, so a slow frame never drops
-// one and a held key never repeats. Positions come back in field coordinates
-// (the renderer's toField maps the window onto the 1280x720 playfield).
+// Mouse and keyboard, queued per frame: clicks and drags become cell
+// picks and swaps, keys become named actions. This module never touches
+// the rules; main.js decides what each gesture means for the screen.
+import { COLS, ROWS, CELL, BOARD_X, BOARD_Y, SURGE_BTN } from './config.js';
 
-const DRAG_MIN = 8;
+function cellFromEvent(canvas, event) {
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const col = Math.floor((x - BOARD_X) / CELL);
+  const row = Math.floor((y - BOARD_Y) / CELL);
+  if (col < 0 || col >= COLS || row < 0 || row >= ROWS) return null;
+  return { col, row, x, y };
+}
 
-export function createInput(canvas, toField) {
-  const clicks = [];
-  const drags = [];
-  const keys = [];
-  let hover = null;
-  let downAt = null;
+function onSurgeButton(x, y) {
+  return x >= SURGE_BTN.x && x <= SURGE_BTN.x + SURGE_BTN.w
+    && y >= SURGE_BTN.y && y <= SURGE_BTN.y + SURGE_BTN.h;
+}
 
-  function fieldPoint(event) {
-    const rect = canvas.getBoundingClientRect();
-    return toField(event.clientX - rect.left, event.clientY - rect.top);
-  }
+export function bindInput(canvas, handlers) {
+  let downCell = null;
+  let downPos = null;
 
   canvas.addEventListener('mousedown', (event) => {
-    downAt = fieldPoint(event);
-  });
-
-  canvas.addEventListener('mousemove', (event) => {
-    hover = fieldPoint(event);
+    const cell = cellFromEvent(canvas, event);
+    const rect = canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    downCell = cell;
+    downPos = { x, y };
+    if (cell === null && onSurgeButton(x, y)) handlers.surgeButton();
   });
 
   canvas.addEventListener('mouseup', (event) => {
-    if (!downAt) return;
-    const up = fieldPoint(event);
-    const moved = Math.hypot(up.x - downAt.x, up.y - downAt.y);
-    if (moved < DRAG_MIN) clicks.push(up);
-    else drags.push({ from: downAt, to: up });
-    downAt = null;
+    const cell = cellFromEvent(canvas, event);
+    if (downCell !== null && cell !== null) {
+      if (cell.col === downCell.col && cell.row === downCell.row) {
+        handlers.pickCell(cell);
+      } else if (Math.abs(cell.col - downCell.col) + Math.abs(cell.row - downCell.row) === 1) {
+        handlers.dragSwap(downCell, cell);
+      } else {
+        handlers.pickCell(cell);
+      }
+    } else if (downPos !== null && cell === null) {
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      if (!onSurgeButton(x, y) && !onSurgeButton(downPos.x, downPos.y)) {
+        handlers.overlayClick();
+      }
+    }
+    downCell = null;
+    downPos = null;
   });
 
-  canvas.addEventListener('mouseleave', () => {
-    hover = null;
-    downAt = null;
-  });
+  canvas.addEventListener('contextmenu', (event) => event.preventDefault());
 
   window.addEventListener('keydown', (event) => {
-    if (event.repeat) return;
-    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(event.code)) {
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.code)) {
       event.preventDefault();
     }
-    keys.push(event.code);
+    if (event.repeat) return;
+    handlers.key(event.code);
   });
-
-  function takeClicks() {
-    return clicks.splice(0, clicks.length);
-  }
-
-  function takeDrags() {
-    return drags.splice(0, drags.length);
-  }
-
-  function takeKeys() {
-    return keys.splice(0, keys.length);
-  }
-
-  function currentHover() {
-    return hover;
-  }
-
-  return { takeClicks, takeDrags, takeKeys, currentHover };
 }
