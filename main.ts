@@ -1,7 +1,7 @@
 // The hand-in program: copies game/ and screenshots/ into the output
 // directory and writes dossier.json there with the kit's vendored builder.
 // Usage: MAKEFUN_OUTPUT_DIR=out node main.ts
-import { cp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, writeFile } from 'node:fs/promises';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
@@ -11,9 +11,11 @@ const root = dirname(fileURLToPath(import.meta.url));
 // read-only, so the output MUST default to /output (the writable dir),
 // exactly as the kit starter does. A repo-relative default ('out') makes
 // mkdir throw on the read-only filesystem and the grade run exit non-zero.
+// Never rm the output dir: in the grader /output is a MOUNTED volume, and
+// rmdir on a mount point fails with EBUSY (round 2's run_completes failure).
+// Like the starter, only mkdir + copy into it.
 const out = resolve(root, process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 
-await rm(out, { recursive: true, force: true });
 await mkdir(join(out, 'game'), { recursive: true });
 await mkdir(join(out, 'screenshots'), { recursive: true });
 await cp(join(root, 'game'), join(out, 'game'), { recursive: true });
